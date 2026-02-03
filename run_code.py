@@ -50,8 +50,7 @@ if __name__ == "__main__":
         "train_freq": 8,
         "WandB": True,  # True if you want to use wandb for logging
         "WandB_project": "EventTrack",
-        "WandB_entity": "<your_wandb_entity>",
-        "WandB_API_key": "fluppy",
+        "WandB_entity": "fluppy",
         "render": True,  # True to disable black screen
         "eval_episodes": 20,
         "eval_mode": False,  # True for model Test - False for Training
@@ -89,7 +88,6 @@ if __name__ == "__main__":
         current_path.mkdir(parents=True, exist_ok=True)
 
         if settings["WandB"]:
-            wandb.login(key=settings["WandB_API_key"])
             wandb.init(
                 project=settings["WandB_project"],
                 entity=settings["WandB_entity"],
