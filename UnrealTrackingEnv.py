@@ -1,14 +1,31 @@
+import random
+import traceback
+
+import cv2
 import gym
 import numpy as np
+import torch
 from scipy.integrate import odeint
 from scipy.spatial.transform.rotation import Rotation as R
+
+from emulator import EventEmulator
 from unreal_api.environment import Environment
-import traceback
-import random
-import cv2
 
 
-def reward_tracking_vision(x, y, z, v=np.zeros((4,)), u=np.zeros((4,)), optimal_distance=2., max_dist=15., min_dist=1., exp=(1 / 3), alpha=0., beta=0., max_steps=400):
+def reward_tracking_vision(
+    x,
+    y,
+    z,
+    v=np.zeros((4,)),
+    u=np.zeros((4,)),
+    optimal_distance=2.0,
+    max_dist=15.0,
+    min_dist=1.0,
+    exp=(1 / 3),
+    alpha=0.0,
+    beta=0.0,
+    max_steps=400,
+):
     done = False
 
     y_ang = np.arctan(y / x)
@@ -29,7 +46,10 @@ def reward_tracking_vision(x, y, z, v=np.zeros((4,)), u=np.zeros((4,)), optimal_
 
     reward = (reward_track - alpha * vel_penalty - beta * u_penalty) * (400 / max_steps)
 
-    if abs(np.linalg.norm(np.array([x, y, z]))) > max_dist or abs(np.linalg.norm(np.array([x, y, z]))) < min_dist:
+    if (
+        abs(np.linalg.norm(np.array([x, y, z]))) > max_dist
+        or abs(np.linalg.norm(np.array([x, y, z]))) < min_dist
+    ):
         done = True
         reward = -10 / (400 / max_steps)
 
@@ -41,9 +61,9 @@ def drone_dyn(X, t, g, m, w, f):
     # Variables and Parameters
     zeta = np.array([0, 0, 1]).reshape(3, 1)
     gv = np.array([0, 0, -1]).reshape(3, 1) * g
-    p = X[0: 3, 0]
-    v = X[3: 6, 0]
-    R = X[6: 15].reshape(3, 3)
+    p = X[0:3, 0]
+    v = X[3:6, 0]
+    R = X[6:15].reshape(3, 3)
 
     # Drone Dynamics
     dp = v
@@ -61,37 +81,50 @@ def sKw(x):
 
 
 class UnrealTrackingEnv(gym.Env):
-    def __init__(self,
-                 rank=0,
-                 test=False,
-                 start_tracker_port=9734,
-                 start_target_port=9735,
-                 render=False,
-                 dr=True,
-                 ts=0.05,
-                 observation_buffer_length=3):
+    def __init__(
+        self,
+        rank=0,
+        test=False,
+        start_tracker_port=9734,
+        start_target_port=9735,
+        render=False,
+        dr=True,
+        ts=0.05,
+        observation_buffer_length=3,
+    ):
         super(UnrealTrackingEnv, self).__init__()
-        print('UnrealTrackingEnv rank: ', rank)
+        print("UnrealTrackingEnv rank: ", rank)
         self.rank = rank
         self.test = test
         self.dr = dr
         self.observation_buffer_length = observation_buffer_length
         self.action_limit = 4
-        self.action_space = gym.spaces.Box(-self.action_limit, self.action_limit, shape=(4,), dtype=np.float32)
+        self.action_space = gym.spaces.Box(
+            -self.action_limit, self.action_limit, shape=(4,), dtype=np.float32
+        )
 
         self.optimal_distance = 0.5
-        self.image_shape = (3, 224, 224)
+        self.event_shape = (2, 224, 224)  # (pos, neg) channels
 
         critic_obs_space = gym.spaces.Box(-np.inf, np.inf, shape=(9,), dtype=np.float32)
-        acotr_obs_space = gym.spaces.Box(0.0, 1.0, shape=(self.observation_buffer_length,) + self.image_shape, dtype=np.float32)
-        self.observation_space = gym.spaces.Dict({
-            'actor': acotr_obs_space,
-            'critic': critic_obs_space
-        })
+        actor_obs_space = gym.spaces.Box(
+            0.0, 1.0, shape=(self.observation_buffer_length,) + self.event_shape, dtype=np.float32
+        )
+        self.observation_space = gym.spaces.Dict(
+            {"actor": actor_obs_space, "critic": critic_obs_space}
+        )
 
         self.state = None
         # Actor History
         self.actor_state = None
+        # Event camera emulator (single env instance)
+        self.event_emulator = EventEmulator(
+            num_envs=1,
+            img_shape=self.event_shape[1:],  # (H, W)
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+        self._event_ready = False
+        self.last_events = None
 
         self.reward = 0
         self.done = 0
@@ -122,9 +155,7 @@ class UnrealTrackingEnv(gym.Env):
         self.prout = np.array([0.0, 0.0, 0.0])
         self.vrout = np.array([0.0, 0.0, 0.0])
         self.arout = np.array([0.0, 0.0, 0.0])
-        self.Rrout = np.array([[1, 0, 0],
-                               [0, 1, 0],
-                               [0, 0, 1]])
+        self.Rrout = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
         self.a1, self.a2, self.a3 = None, None, None
         self.phi1, self.phi2, self.phi3 = None, None, None
         self.ws1, self.ws2, self.ws3 = None, None, None
@@ -137,26 +168,18 @@ class UnrealTrackingEnv(gym.Env):
         self.port_target = start_target_port + (self.rank * 2)
         self.sensor_settings = {
             "RGBCamera": {
-                "width": self.image_shape[1],
-                "height": self.image_shape[2],
+                "width": self.event_shape[1],
+                "height": self.event_shape[2],
                 "channels": "RGB",
                 "FOV": 90,
-                "show": self.test
+                "show": self.test,
             },
-            "GPS": {}
+            "GPS": {},
         }
         self.action_manager_settings = {  # X Y Z PYR
-            "CoordinateActionManager": {
-                "command_dict": {
-                    "MOVETO": 0
-                },
-                "settings": {
-                }
-            }
+            "CoordinateActionManager": {"command_dict": {"MOVETO": 0}, "settings": {}}
         }
-        self.reset_manager_settings = {
-            "EnvResetManager": {}
-        }
+        self.reset_manager_settings = {"EnvResetManager": {}}
         self.observation_list_target = []
         self.observation_list_tracker = ["RGBCamera"]
 
@@ -166,9 +189,22 @@ class UnrealTrackingEnv(gym.Env):
         try:
             if len(self.envs) == 0:
                 self.envs.append(
-                    Environment(self.port_tracker, self.sensor_settings, self.action_manager_settings, reset_manager_settings=self.reset_manager_settings, render=render))
+                    Environment(
+                        self.port_tracker,
+                        self.sensor_settings,
+                        self.action_manager_settings,
+                        reset_manager_settings=self.reset_manager_settings,
+                        render=render,
+                    )
+                )
                 self.envs.append(
-                    Environment(self.port_target, self.sensor_settings, self.action_manager_settings, render=render))
+                    Environment(
+                        self.port_target,
+                        self.sensor_settings,
+                        self.action_manager_settings,
+                        render=render,
+                    )
+                )
                 self.connected = True
         except:
             print("ERROR: Cannot connect to Unreal")
@@ -215,25 +251,44 @@ class UnrealTrackingEnv(gym.Env):
         self.prout = self.pr0
         self.vrout = np.array([0.0, 0.0, 0.0])
         self.arout = np.array([0.0, 0.0, 0.0])
-        self.Rrout = np.array([[1, 0, 0],
-                               [0, 1, 0],
-                               [0, 0, 1]])
+        self.Rrout = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
 
     def step(self, u):
         # Define a control input for the tracker
         u = u.reshape(self.action_space.shape[0], 1)
 
         self.episode_steps += 1
-        if self.move_target and (self.episode_steps <= self.stop_step or self.episode_steps > (self.stop_step + self.stop_duration)):
-            self.prout = np.array([self.a1 * np.sin(self.phi1 + self.ws1 * self.T_target) - self.a1 * np.sin(self.phi1) + self.pr0[0],
-                                   self.a2 * np.sin(self.phi2 + self.ws2 * self.T_target) - self.a2 * np.sin(self.phi2) + self.pr0[1],
-                                   self.a3 * np.sin(self.phi3 + self.ws3 * self.T_target) - self.a3 * np.sin(self.phi3) + self.pr0[2]])
-            self.vrout = np.array([self.a1 * self.ws1 * np.cos(self.phi1 + self.T_target * self.ws1),
-                                   self.a2 * self.ws2 * np.cos(self.phi2 + self.T_target * self.ws2),
-                                   self.a3 * self.ws3 * np.cos(self.phi3 + self.T_target * self.ws3)])
-            self.arout = np.array([-self.a1 * self.ws1 ** 2 * np.sin(self.phi1 + self.T_target * self.ws1),
-                                   -self.a2 * self.ws2 ** 2 * np.sin(self.phi2 + self.T_target * self.ws2),
-                                   -self.a3 * self.ws3 ** 2 * np.sin(self.phi3 + self.T_target * self.ws3)])
+        if self.move_target and (
+            self.episode_steps <= self.stop_step
+            or self.episode_steps > (self.stop_step + self.stop_duration)
+        ):
+            self.prout = np.array(
+                [
+                    self.a1 * np.sin(self.phi1 + self.ws1 * self.T_target)
+                    - self.a1 * np.sin(self.phi1)
+                    + self.pr0[0],
+                    self.a2 * np.sin(self.phi2 + self.ws2 * self.T_target)
+                    - self.a2 * np.sin(self.phi2)
+                    + self.pr0[1],
+                    self.a3 * np.sin(self.phi3 + self.ws3 * self.T_target)
+                    - self.a3 * np.sin(self.phi3)
+                    + self.pr0[2],
+                ]
+            )
+            self.vrout = np.array(
+                [
+                    self.a1 * self.ws1 * np.cos(self.phi1 + self.T_target * self.ws1),
+                    self.a2 * self.ws2 * np.cos(self.phi2 + self.T_target * self.ws2),
+                    self.a3 * self.ws3 * np.cos(self.phi3 + self.T_target * self.ws3),
+                ]
+            )
+            self.arout = np.array(
+                [
+                    -self.a1 * self.ws1**2 * np.sin(self.phi1 + self.T_target * self.ws1),
+                    -self.a2 * self.ws2**2 * np.sin(self.phi2 + self.T_target * self.ws2),
+                    -self.a3 * self.ws3**2 * np.sin(self.phi3 + self.T_target * self.ws3),
+                ]
+            )
 
             self.T_target += self.Ts_target
         else:
@@ -243,84 +298,145 @@ class UnrealTrackingEnv(gym.Env):
         # Integrate dynamics
         t = [self.Tin, self.Tin + self.Ts]
         # TRACKER #
-        u = u.reshape(self.action_space.shape[0], )
+        u = u.reshape(
+            self.action_space.shape[0],
+        )
 
         w = u[:3]
         f = (u[3] * 5 + 20.2) / 2
         self.fk = f
 
-        Xout = odeint(drone_dyn, self.Xin.squeeze(), t, args=(self.g, self.m, w, self.fk))  # X, t, g, m, w, f
+        Xout = odeint(
+            drone_dyn, self.Xin.squeeze(), t, args=(self.g, self.m, w, self.fk)
+        )  # X, t, g, m, w, f
 
         Xout = Xout[-1, :].T
         Tout = t[-1]
 
         # Tracker output variables
-        pout = Xout[0: 3]
-        vout = Xout[3: 6]
-        Rout = Xout[6: 15].reshape(3, 3)
+        pout = Xout[0:3]
+        vout = Xout[3:6]
+        Rout = Xout[6:15].reshape(3, 3)
 
         zeta = np.array([0, 0, 1]).reshape(3, 1)
         gv = np.array([0, 0, -1]).reshape(3, 1) * self.g
-        aout = (np.dot(Rout, zeta) * (self.fk / self.m) + gv).reshape(3, )
+        aout = (np.dot(Rout, zeta) * (self.fk / self.m) + gv).reshape(
+            3,
+        )
 
         # X Y Z of the target wrt to the tracker at time Tout
-        x, y, z = np.dot(np.dot(np.array([1, 0, 0]), Rout.T), self.prout - pout), \
-                  np.dot(np.dot(np.array([0, 1, 0]), Rout.T), self.prout - pout), \
-                  np.dot(np.dot(np.array([0, 0, 1]), Rout.T), self.prout - pout)
+        x, y, z = (
+            np.dot(np.dot(np.array([1, 0, 0]), Rout.T), self.prout - pout),
+            np.dot(np.dot(np.array([0, 1, 0]), Rout.T), self.prout - pout),
+            np.dot(np.dot(np.array([0, 0, 1]), Rout.T), self.prout - pout),
+        )
 
-        v_x, v_y, v_z = np.dot(np.dot(np.array([1, 0, 0]), Rout.T), self.vrout - vout), \
-                        np.dot(np.dot(np.array([0, 1, 0]), Rout.T), self.vrout - vout), \
-                        np.dot(np.dot(np.array([0, 0, 1]), Rout.T), self.vrout - vout)
+        v_x, v_y, v_z = (
+            np.dot(np.dot(np.array([1, 0, 0]), Rout.T), self.vrout - vout),
+            np.dot(np.dot(np.array([0, 1, 0]), Rout.T), self.vrout - vout),
+            np.dot(np.dot(np.array([0, 0, 1]), Rout.T), self.vrout - vout),
+        )
 
-        a_x, a_y, a_z = np.dot(np.dot(np.array([1, 0, 0]), Rout.T), self.arout - aout), \
-                        np.dot(np.dot(np.array([0, 1, 0]), Rout.T), self.arout - aout), \
-                        np.dot(np.dot(np.array([0, 0, 1]), Rout.T), self.arout - aout)
+        a_x, a_y, a_z = (
+            np.dot(np.dot(np.array([1, 0, 0]), Rout.T), self.arout - aout),
+            np.dot(np.dot(np.array([0, 1, 0]), Rout.T), self.arout - aout),
+            np.dot(np.dot(np.array([0, 0, 1]), Rout.T), self.arout - aout),
+        )
 
         # Unreal Rendering
         # Target
-        p_target = self.prout.reshape(3,)
+        p_target = self.prout.reshape(
+            3,
+        )
         R_target = self.Rrout
         qx, qy, qz, qw = R.from_matrix(R_target).as_quat()
-        action_target = [p_target[0] * self.ue_to_meters + self.offset[0], p_target[1] * self.ue_to_meters + self.offset[1], p_target[2] * self.ue_to_meters + self.offset[2], qx, qy, qz, qw]
+        action_target = [
+            p_target[0] * self.ue_to_meters + self.offset[0],
+            p_target[1] * self.ue_to_meters + self.offset[1],
+            p_target[2] * self.ue_to_meters + self.offset[2],
+            qx,
+            qy,
+            qz,
+            qw,
+        ]
         self.envs[1].env_step(action_target, self.observation_list_target)
 
         # Tracker
-        p_tracker = self.Xin[0: 3].reshape(3,)
-        R_tracker = self.Xin[6: 15].reshape(3, 3)
+        p_tracker = self.Xin[0:3].reshape(
+            3,
+        )
+        R_tracker = self.Xin[6:15].reshape(3, 3)
         qx, qy, qz, qw = R.from_matrix(R_tracker).as_quat()
-        action_tracker = [p_tracker[0] * self.ue_to_meters + self.offset[0], p_tracker[1] * self.ue_to_meters + self.offset[1], p_tracker[2] * self.ue_to_meters + self.offset[2], qx, qy, qz, qw]
+        action_tracker = [
+            p_tracker[0] * self.ue_to_meters + self.offset[0],
+            p_tracker[1] * self.ue_to_meters + self.offset[1],
+            p_tracker[2] * self.ue_to_meters + self.offset[2],
+            qx,
+            qy,
+            qz,
+            qw,
+        ]
 
         _, obs = self.envs[0].env_step(action_tracker, self.observation_list_tracker)
 
+        # Convert RGB image to grayscale for event generation
         image = cv2.cvtColor((obs[0] * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-        norm_image = (image.astype(np.float32) / 255).reshape(self.image_shape)
+        gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
+        # Initialize event emulator on first frame
+        if not self._event_ready:
+            self.event_emulator.reset_indices(
+                init_frames=gray_image[None, ...],
+                env_ids=[0],
+                randomize_thresholds=self.dr,
+            )
+            self._event_ready = True
+
+        # Generate event frame: shape (1, 2, H, W)
+        event_frame = self.event_emulator.generate_events(
+            gray_image[None, ...], delta_time_s=self.Ts
+        )
+        # Convert to numpy and remove batch dim: (2, H, W)
+        event_frame_np = event_frame.squeeze(0).cpu().numpy()
+
+        # Build actor state with event_frame history buffer
         state_critic = np.array([x, y, z, v_x, v_y, v_z, a_x, a_y, a_z]).reshape((1, 9))
-        state_actor = np.expand_dims(norm_image, axis=0)
+        state_actor = np.expand_dims(event_frame_np, axis=0)  # (1, 2, H, W)
         if self.actor_state is None:
             self.actor_state = [state_actor] * self.observation_buffer_length
         self.actor_state.append(state_actor)
         self.actor_state.pop(0)
-        current_state_actor = np.concatenate(self.actor_state, axis=0)
-        self.state = {
-            'actor': current_state_actor,
-            'critic': state_critic
-        }
+        current_state_actor = np.concatenate(self.actor_state, axis=0)  # (buffer_len, 2, H, W)
+        self.state = {"actor": current_state_actor, "critic": state_critic}
 
         # SubProcVecEnv Fix
-        self.state['critic'] = self.state['critic'].flatten()
-
+        self.state["critic"] = self.state["critic"].flatten()
 
         # Reward Computation
-        self.reward, self.done = reward_tracking_vision(x, y, z,
-                                                        v=np.array([v_x, v_y, v_z]),
-                                                        u=(u - np.array([0, 0, 0, self.m * self.g]) / np.array([self.action_limit, self.action_limit, self.action_limit, self.action_limit * 5 / 2])),
-                                                        optimal_distance=self.optimal_distance,
-                                                        min_dist=0.3,
-                                                        max_dist=3.0,
-                                                        alpha=0.4,
-                                                        beta=0.4,
-                                                        max_steps=self.max_episode_steps)
+        self.reward, self.done = reward_tracking_vision(
+            x,
+            y,
+            z,
+            v=np.array([v_x, v_y, v_z]),
+            u=(
+                u
+                - np.array([0, 0, 0, self.m * self.g])
+                / np.array(
+                    [
+                        self.action_limit,
+                        self.action_limit,
+                        self.action_limit,
+                        self.action_limit * 5 / 2,
+                    ]
+                )
+            ),
+            optimal_distance=self.optimal_distance,
+            min_dist=0.3,
+            max_dist=3.0,
+            alpha=0.4,
+            beta=0.4,
+            max_steps=self.max_episode_steps,
+        )
 
         # Update loop states
         self.Xin = Xout
@@ -335,6 +451,8 @@ class UnrealTrackingEnv(gym.Env):
         self.episode_steps = 0
         self.stop_step = random.randint(0, self.max_episode_steps)
         self.actor_state = None
+        self._event_ready = False
+        self.last_events = None
 
         # INITIAL CONDITIONS
         # Tracker
@@ -351,12 +469,12 @@ class UnrealTrackingEnv(gym.Env):
 
         # Domain Randomization
         if self.dr:
-            self.envs[0].reset([], {'scale': 0.25})
+            self.envs[0].reset([], {"scale": 0.25})
 
         self.step(np.array([0.0, 0.0, 0.0, self.fk]))
         self.done = False
 
         return self.state
 
-    def render(self, mode='human'):
+    def render(self, mode="human"):
         pass

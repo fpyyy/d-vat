@@ -72,7 +72,7 @@ class DenseActor(BasePolicy):
         above zero and prevent it from growing too fast. In practice, ``exp()`` is usually enough.
     :param clip_mean: Clip the mean output when using gSDE to avoid numerical instability.
     :param normalize_images: Whether to normalize images or not,
-         dividing by 255.0 (True by default)
+         dividing by 255.0 (False by default for event_frame)
     """
 
     def __init__(
@@ -89,7 +89,7 @@ class DenseActor(BasePolicy):
         sde_net_arch: Optional[List[int]] = None,
         use_expln: bool = False,
         clip_mean: float = 2.0,
-        normalize_images: bool = True,
+        normalize_images: bool = False,
     ):
         super().__init__(
             observation_space,
@@ -224,7 +224,7 @@ class DenseContinuousCritic(BaseModel):
         features_extractor: nn.Module,
         features_dim: int,
         activation_fn: Type[nn.Module] = nn.ReLU,
-        normalize_images: bool = True,
+        normalize_images: bool = False,
         n_critics: int = 2,
         share_features_extractor: bool = True,
     ):
@@ -287,7 +287,7 @@ class SACDensePolicy(SACPolicy):
     :param features_extractor_kwargs: Keyword arguments
         to pass to the features extractor.
     :param normalize_images: Whether to normalize images or not,
-         dividing by 255.0 (True by default)
+         dividing by 255.0 (False by default for event_frame)
     :param optimizer_class: The optimizer to use,
         ``th.optim.Adam`` by default
     :param optimizer_kwargs: Additional keyword arguments,
@@ -304,9 +304,10 @@ class SACDensePolicy(SACPolicy):
         )
 
     def make_actor(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> DenseActor:
-        actor_kwargs = self.actor_kwargs
-        observation_space = actor_kwargs['observation_space']
-        actor_kwargs['observation_space'] = observation_space['actor']
+        actor_kwargs = dict(self.actor_kwargs)
+        observation_space = actor_kwargs["observation_space"]
+        actor_kwargs["observation_space"] = observation_space["actor"]
+        actor_kwargs["normalize_images"] = False
         features_extractor = CustomCNN(observation_space['actor'])
         actor_kwargs = self._update_features_extractor(actor_kwargs, features_extractor)
         actor_kwargs['features_dim'] = 512
@@ -315,15 +316,16 @@ class SACDensePolicy(SACPolicy):
     def make_critic(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> DenseContinuousCritic:
 
 
-        critic_kwargs = self.critic_kwargs
-        observation_space = critic_kwargs['observation_space']
+        critic_kwargs = dict(self.critic_kwargs)
+        observation_space = critic_kwargs["observation_space"]
 
         if(type(observation_space) ==  gym.spaces.dict.Dict):
-            critic_kwargs['observation_space'] = observation_space['critic']
+            critic_kwargs["observation_space"] = observation_space["critic"]
 
         features_extractor = None
         print("Critic :", features_extractor)
         critic_kwargs = self._update_features_extractor(critic_kwargs, features_extractor)
+        critic_kwargs["normalize_images"] = False
 
         if (type(observation_space) == gym.spaces.dict.Dict):
             critic_kwargs ['features_dim'] = observation_space['critic'].shape[0]

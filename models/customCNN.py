@@ -6,7 +6,6 @@ import torch
 import torch as th
 import torch.nn as nn
 import torchvision.models as models
-from torchvision import transforms
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
@@ -23,15 +22,34 @@ class CustomCNN(BaseFeaturesExtractor):
         # We assume CxHxW images (channels first)
         # Re-ordering will be done by pre-preprocessing or wrapper
 
-        ''' Resnet18 da pytorch '''
+        # Load pretrained ResNet18
         resnet18 = models.resnet18(pretrained=True)
+
+        # Modify the first conv layer: 3 channels -> 2 channels
+        # Copy weights from R (index 0) and B (index 2) channels
+        original_conv1 = resnet18.conv1
+        new_conv1 = nn.Conv2d(
+            in_channels=2,
+            out_channels=original_conv1.out_channels,
+            kernel_size=original_conv1.kernel_size,
+            stride=original_conv1.stride,
+            padding=original_conv1.padding,
+            bias=original_conv1.bias is not None,
+        )
+
+        # Copy pretrained weights: R (0) -> channel 0, B (2) -> channel 1
+        with th.no_grad():
+            new_conv1.weight[:, 0, :, :] = original_conv1.weight[:, 0, :, :]  # R -> pos
+            new_conv1.weight[:, 1, :, :] = original_conv1.weight[:, 2, :, :]  # B -> neg
+            if original_conv1.bias is not None:
+                new_conv1.bias.copy_(original_conv1.bias)
+
+        resnet18.conv1 = new_conv1
+
+        # Remove the final FC layer
         self.resnet = th.nn.Sequential(*(list(resnet18.children()))[:-1])
         for param in self.resnet.parameters():
             param.requires_grad = True
-
-        self.preprocess = transforms.Compose([
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
 
         # Compute shape by doing one forward pass
         with th.no_grad():
@@ -46,17 +64,13 @@ class CustomCNN(BaseFeaturesExtractor):
         self.linear = nn.Sequential(nn.Flatten(), nn.Linear(self.n_flatten, features_dim), nn.ReLU())
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
-        # Preprocess
-        # t = time.time()
-        input_batch = self.preprocess(observations)
-
-        b, s, c, w, h = input_batch.shape
-        x0 = input_batch.view(-1, c, w, h)
+        # No preprocessing needed - event_frame is already in [0, 1) range
+        b, s, c, w, h = observations.shape
+        x0 = observations.view(-1, c, w, h)
 
         x1 = self.resnet(x0)
         x1 = x1.view(b, s, -1)
         x2 = torch.flatten(x1, start_dim=1)
         x3 = self.linear(x2)
-        # print("Time: ", time.time() - t, observations.shape)
         return x3
 

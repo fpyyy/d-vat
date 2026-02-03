@@ -1,0 +1,6 @@
+{
+  "ruff.configuration": {
+    "target-version": "py38"
+  },
+  "chatgpt.commentCodeLensEnabled": false
+}
