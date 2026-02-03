@@ -48,10 +48,10 @@ if __name__ == "__main__":
         "batch_size": 64,
         "buffer_size": 10000,
         "train_freq": 8,
-        "WandB": False,  # True if you want to use wandb for logging
-        "WandB_project": "<your_wandb_project>",
+        "WandB": True,  # True if you want to use wandb for logging
+        "WandB_project": "EventTrack",
         "WandB_entity": "<your_wandb_entity>",
-        "WandB_API_key": "<your_wandb_api_key>",
+        "WandB_API_key": "fluppy",
         "render": True,  # True to disable black screen
         "eval_episodes": 20,
         "eval_mode": False,  # True for model Test - False for Training
@@ -93,7 +93,7 @@ if __name__ == "__main__":
             wandb.init(
                 project=settings["WandB_project"],
                 entity=settings["WandB_entity"],
-                name=f"SAC_{t}",
+                name=f"DEvat_{t}",
                 config=settings,
             )
 
